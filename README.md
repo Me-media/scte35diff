@@ -161,11 +161,11 @@ GOP structure.
 
 One detail that matters: an IDR access unit needs SPS/PPS (HEVC:
 VPS/SPS/PPS) available for a standalone decoder to make sense of it. If
-your encoder runs with `repeatHeaders=1` (as in your xcoder parameters),
-SPS/PPS already accompany every IDR, and that's sufficient. If
-`repeatHeaders=0` anywhere in your chain, the tool automatically caches the
-most recently seen SPS/PPS units from the stream and prepends them to a
-lone IDR that lacks its own, so decoding still succeeds.
+your encoder runs with `repeatHeaders=1`, SPS/PPS already accompany every IDR,
+and that's sufficient. If `repeatHeaders=0` anywhere in your chain, 
+the tool automatically caches the most recently seen SPS/PPS units from the 
+stream and prepends them to a lone IDR that lacks its own, so decoding still 
+succeeds.
 
 The work happens in a background thread (queue + separate thread running
 `ffmpeg`), so a JPEG decode (tens of milliseconds) never blocks multicast
