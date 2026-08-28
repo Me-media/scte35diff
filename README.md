@@ -1,5 +1,9 @@
 # scte35_idr_diff — SCTE-35 vs. IDR PTS delta over multicast
 
+**Version: 0.8** (run `python3 scte35_idr_diff.py --version` to confirm
+which version is running; see "Version history" at the end of this
+document.)
+
 Measures, live off a multicast MPEG-TS stream, the difference in milliseconds
 between the PTS an SCTE-35 splice message points to (`splice_insert` /
 `time_signal`, program-level) and the PTS of the nearest IDR frame in the
@@ -82,6 +86,18 @@ python3 scte35_idr_diff.py --addr 239.1.1.1 --port 5000 \
 python3 scte35_idr_diff.py --addr 239.1.1.1 --port 5000 \
     --csv-out splice_report.csv \
     --ts-dump-dir ts_dumps/ --ts-dump-window 60s --ts-dump-max-files 200
+
+# Tighter limit on how much the ACTUAL pre-roll (measured in real time) may
+# fall short of the DECLARED one (from the cue's own PTS) before being
+# flagged PREROLL_SHORT -- default is 500 ms:
+python3 scte35_idr_diff.py --addr 239.1.1.1 --port 5000 \
+    --csv-out splice_report.csv --preroll-tolerance-ms 250
+
+# Adjust SCTE-35's own apparent 4-second minimum advance-notice requirement
+# (cited, not primary-source-verified -- see "Time to event vs. actual
+# pre-roll") if your chain deliberately runs to a different agreed minimum:
+python3 scte35_idr_diff.py --addr 239.1.1.1 --port 5000 \
+    --csv-out splice_report.csv --min-time-to-event-ms 5000
 ```
 
 Key flags:
@@ -105,17 +121,21 @@ Key flags:
 | `--ts-dump-all` | With `--ts-dump-dir`: save EVERY window, not just ones with an SCTE-35 event — turns the tool into a plain rolling raw-TS recorder. |
 | `--ts-dump-no-preroll` | With `--ts-dump-dir`: do NOT include the previous window in the saved dump (default is to include it for pre-roll context). Halves the memory footprint and file size. |
 | `--ts-dump-max-files N` | With `--ts-dump-dir`: delete the oldest saved dumps once more than N exist. **Strongly recommended** in production — otherwise there's no upper bound on disk usage. |
+| `--preroll-tolerance-ms` | **New.** How far the ACTUAL pre-roll (real, wall-clock-measured time between a cue being registered and its IDR being observed) may fall short of the DECLARED one (`time_to_event_ms`, computed from the cue's own PTS) before `preroll_verdict` is set to `PREROLL_SHORT` (default 500 ms). Only a shortfall in actual pre-roll is flagged — extra pre-roll is never a problem. See "Time to event vs. actual pre-roll" below. |
+| `--min-time-to-event-ms` | **New.** Minimum DECLARED `time_to_event_ms` the FIRST transmission of a `splice_event_id` must have to satisfy SCTE-35's own minimum advance-notice requirement (per secondary sources citing ANSI/SCTE 35 (2019) 9.2/10.3.3 — default 4000 ms, not primary-source-verified, see below). Below this, `signal_verdict=SIGNAL_LATE` is flagged; later retransmissions of the same `event_id` are reported as `RETRANSMISSION` instead of being re-evaluated. |
 
 Stop with Ctrl-C. Results are printed to stdout continuously, plus
 CSV/JSON/SCTE-35 logs if configured.
 
 **Note when upgrading from an earlier version:** the `--csv-out` schema has
 gained new columns over time (`cue_seq`, `raw_pts_time_s`,
-`pts_adjustment_ticks`, `segmentation_summary`, `snapshot_path`, and most
-recently `pre_frame_snapshot_paths`). The header row is only written when
-the file is empty, so an existing CSV file from before these changes will
-get **misaligned columns** if you keep writing to the same path — point
-`--csv-out` at a new file after upgrading.
+`pts_adjustment_ticks`, `segmentation_summary`, `snapshot_path`,
+`pre_frame_snapshot_paths`, `time_to_event_ms`, `actual_preroll_ms`,
+`preroll_delta_ms`, `preroll_verdict`, and most recently
+`signal_verdict`). The header row is only written when the file is empty,
+so an existing CSV file from before these changes will get **misaligned
+columns** if you keep writing to the same path — point `--csv-out` at a
+new file after upgrading.
 
 ### Known bug fixed: false large negative delta values
 
@@ -161,11 +181,11 @@ GOP structure.
 
 One detail that matters: an IDR access unit needs SPS/PPS (HEVC:
 VPS/SPS/PPS) available for a standalone decoder to make sense of it. If
-your encoder runs with `repeatHeaders=1`, SPS/PPS already accompany every IDR,
-and that's sufficient. If `repeatHeaders=0` anywhere in your chain, 
-the tool automatically caches the most recently seen SPS/PPS units from the 
-stream and prepends them to a lone IDR that lacks its own, so decoding still 
-succeeds.
+your encoder runs with `repeatHeaders=1` (as in your xcoder parameters),
+SPS/PPS already accompany every IDR, and that's sufficient. If
+`repeatHeaders=0` anywhere in your chain, the tool automatically caches the
+most recently seen SPS/PPS units from the stream and prepends them to a
+lone IDR that lacks its own, so decoding still succeeds.
 
 The work happens in a background thread (queue + separate thread running
 `ffmpeg`), so a JPEG decode (tens of milliseconds) never blocks multicast
@@ -285,6 +305,92 @@ reception.
 and can be freely combined with them — one gives you individual JPEG
 frames, the other gives you the entire raw stream.
 
+## Time to event vs. actual pre-roll
+
+Every match/miss row (console, CSV, JSON) carries five fields that measure
+and compare **declared** lead time, **actual** lead time, and whether the
+signaling itself met SCTE-35's own minimum requirement — all always
+computed, no flag required to see them:
+
+| Field | Meaning |
+|---|---|
+| `time_to_event_ms` | DECLARED lead time: the cue's target PTS minus the most recently observed video PTS at the moment the cue was registered (i.e. "how far into the future, per the transport stream's own PTS clock, was this splice point signaled"). `null`/empty if no video AU had been observed yet when the cue arrived. |
+| `actual_preroll_ms` | ACTUAL lead time: real, wall-clock-measured time (via a monotonic clock, unaffected by NTP jumps) between registering the cue and observing the matching IDR. `null`/empty for a MISSED cue (it never got an IDR to measure against). |
+| `preroll_delta_ms` | `actual_preroll_ms − time_to_event_ms`. Negative means the actual lead time was SHORTER than the declared one — i.e. downstream equipment (ad decisioning, splicer) got less real reaction time than the cue promised. |
+| `preroll_verdict` | `PREROLL_SHORT` if `preroll_delta_ms` is more negative than `-preroll-tolerance-ms` (default 500 ms); otherwise `OK`; `N/A` if either figure is missing (no video PTS yet, or MISSED). **This is the tool's OWN operational measure, not a cited SCTE-35 requirement** (see below). |
+| `signal_verdict` | `SIGNAL_LATE` if the FIRST registered occurrence of a `splice_event_id` had `time_to_event_ms` below `--min-time-to-event-ms` (default 4000 ms); `OK` if not; `RETRANSMISSION` for later resends of the same `event_id` (not re-evaluated); `N/A` if `time_to_event_ms` could not be computed. **This one IS intended to reflect an actual (secondary-source-cited, not primary-source-verified) SCTE-35 requirement** — see below. |
+
+**The exact scenario that motivated the first four fields:** a marker with
+`time_to_event_ms=3052` but `actual_preroll_ms=1856` — an actual shortfall
+of roughly 1.2 seconds versus what the cue promised. With the default
+tolerance (500 ms), that is flagged `PREROLL_SHORT`.
+
+**Does this violate the SCTE-35 standard?** This question needs splitting
+in two, and our earlier answer to the first half was too categorical:
+
+1. **Was the message itself sent far enough in advance?** Per secondary
+   sources citing ANSI/SCTE 35 (the 2019 revision) §9.2 (`splice_insert()`)
+   and §10.3.3 (`time_signal()`), the message **shall** be "sent at least
+   once a minimum of 4 seconds in advance of the desired splice time".
+   This is corroborated independently by ETSI TS 103 752-1 (DVB, clause
+   7.2), which cites the same 4-second minimum directly from SCTE-35. If
+   `time_to_event=3052ms` was the FIRST transmission of that event (not a
+   later retransmission closer to the splice point), it falls short of
+   this requirement — **that is exactly what the new `signal_verdict`/
+   `--min-time-to-event-ms` field now checks.** We have not been able to
+   verify this citation against the primary text of the ANSI/SCTE 35
+   document itself (the full text was not accessible) — treat it as
+   secondary-source-corroborated, not primary-source-verified, until you
+   check it against a licensed copy.
+2. **Was the actual pre-roll delivered in line with what the cue
+   declared?** Here our original answer stands: ANSI/SCTE 35 does NOT
+   require the declared and actually-delivered lead times to be equal, and
+   specifies no tolerance for that gap — `preroll_verdict`/`PREROLL_SHORT`
+   is the tool's OWN operational measure, not a cited requirement. The
+   concept of "pre-roll time" as an explicit, configured lead time for the
+   WHOLE chain (automation → encoder → network) instead comes from
+   **SCTE-104** (the `pre_roll_time` parameter) and vendor/operator policy.
+   We also have not been able to access the full text of ANSI/SCTE 67
+   (Recommended Practices for Digital Program Insertion for Cable) to see
+   whether it specifies its own minimum here — the full text was not
+   reachable (blocked by robots.txt/403 on the sources tried).
+
+That said: however the formal requirements ultimately get interpreted, a
+real shortfall of this magnitude (~1.2s) is **operationally significant**
+regardless — it means downstream ad-decisioning/splicing got materially
+less real reaction time than the cue implied, which in the worst case
+shows up as a delayed or missed switch.
+
+**An important complication for `signal_verdict`:** the §9.2 requirement
+is about the FIRST transmission of a given event — an encoder is often
+expected to send the same cue repeatedly (protection against packet loss),
+and each later retransmission naturally has a smaller `time_to_event_ms`
+as the splice point gets closer. The tool therefore tracks which
+`splice_event_id` values it has already seen: only the FIRST occurrence is
+evaluated against `--min-time-to-event-ms`; later occurrences of the same
+`event_id` are reported as `RETRANSMISSION` and not re-flagged. If
+`event_id` is missing entirely (unusual), each occurrence is evaluated on
+its own, since there's then no way to tell which ones belong together.
+
+**Three important limitations to be aware of** (see also items 7–8 in
+"Important caveats" below):
+
+1. `time_to_event_ms` uses the NEAREST PRECEDING video AU's PTS as the
+   reference point for "when the message was sent", instead of a full
+   PCR/STC clock interpolation (which is how professional TS analyzers
+   normally perform this measurement). That introduces a small, bounded
+   error — roughly one frame interval (e.g. ~42 ms at 24 fps) — but
+   requires no PCR parsing.
+2. `actual_preroll_ms` is only meaningful if the stream is actually being
+   received in genuine real time (a live multicast feed). If a recorded
+   file is replayed faster or slower than real time, `actual_preroll_ms` —
+   and therefore `preroll_verdict` — will be misleading.
+3. `signal_verdict`'s dedup on `splice_event_id` assumes your encoder
+   actually reuses the same `event_id` when resending the same event
+   (standard practice), and does not reuse an `event_id` across two
+   genuinely different events. If your chain deviates from this, the
+   dedup logic may need revisiting.
+
 ## Important caveats — read before treating results as ground truth in a compliance report
 
 1. **pts_adjustment**: Per the SCTE-35 spec, `pts_adjustment` in
@@ -316,6 +422,27 @@ frames, the other gives you the entire raw stream.
    tester. For unexpected or critical results: verify against a reference
    implementation, e.g. `tsp -P scte35 -a -P pes -i --pid <video-pid>` in
    TSDuck, before escalating to a vendor.
+7. **time_to_event_ms/actual_preroll_ms are approximations, not a
+   certified measurement**: `time_to_event_ms` uses the nearest preceding
+   video AU's PTS instead of a full PCR/STC interpolation (error bounded
+   to roughly one frame interval), and `actual_preroll_ms` assumes the
+   stream is being received in genuine real time. ANSI/SCTE 35 does NOT
+   require these two figures to be equal — `preroll_verdict`/
+   `PREROLL_SHORT` is the tool's own operational measure, not a cited
+   standards requirement. See "Time to event vs. actual pre-roll" above
+   for the full explanation before citing a `PREROLL_SHORT` result as a
+   standards violation.
+8. **signal_verdict rests on a secondary-source-cited, not primary-source-
+   verified, reading of SCTE-35**: per sources citing ANSI/SCTE 35 (2019)
+   9.2/10.3.3 (corroborated independently by ETSI TS 103 752-1), a splice
+   message must be sent at least once at least 4 seconds in advance —
+   `signal_verdict=SIGNAL_LATE`/`--min-time-to-event-ms` reflects exactly
+   that requirement, but we have not been able to read the primary text of
+   the ANSI/SCTE 35 document itself to verify the citation verbatim. The
+   dedup logic (only the FIRST occurrence of a `splice_event_id` is
+   evaluated, later resends are reported as `RETRANSMISSION`) assumes your
+   encoder reuses `event_id` consistently on resend — see "Time to event
+   vs. actual pre-roll" above.
 
 ## Multiple instances at once (multiple channels/terminals)
 
@@ -365,7 +492,23 @@ correctly omits the previous window, and that `--ts-dump-max-files` deletes
 the oldest dumps (plus their `.json` sidecars) in the right order. These
 tests force window rotation deterministically (by back-dating the window
 start timestamp) instead of relying on real `sleep()` calls, so they're
-fast and not sensitive to machine load. This sandbox has no PyPI access, so
+fast and not sensitive to machine load. One further test
+(`test_time_to_event_and_actual_preroll`) verifies
+`time_to_event_ms`/`actual_preroll_ms`/`preroll_delta_ms`/`preroll_verdict`:
+that `time_to_event_ms` is `None` before any video PTS has been observed,
+that a large actual shortfall against the declared lead time is correctly
+flagged `PREROLL_SHORT` while a small shortfall within tolerance is `OK`,
+and that a MISSED cue has no `actual_preroll_ms` but still retains its
+`time_to_event_ms`. As with the TS-dump tests, the internal timestamp
+(`register_monotonic`) is back-dated deterministically instead of relying
+on a real `sleep()` call. One further test
+(`test_signal_verdict_min_time_to_event`) verifies `signal_verdict`/
+`--min-time-to-event-ms`: that a first transmission below the 4-second
+floor is flagged `SIGNAL_LATE`, that one at or above the floor is `OK`,
+that a retransmission of the same `event_id` is correctly reported as
+`RETRANSMISSION` instead of being re-evaluated, and that cues with no
+`event_id` (nothing to dedupe on) are each evaluated independently.
+This sandbox has no PyPI access, so
 the actual `threefive3` decoding (external, well-established library) could
 not be exercised here — run `pip install threefive3` and test against a
 real or recorded multicast stream before production use.
@@ -373,3 +516,26 @@ real or recorded multicast stream before production use.
 ```bash
 python3 test_offline.py
 ```
+
+## Version history
+
+`__version__` in `scte35_idr_diff.py` (check with `--version`) is also
+stamped into `--json-out`, `--scte35-out`, and `--ts-dump-dir`'s JSON
+sidecar files (the `tool_version` field), so a saved report/dump file can
+always be traced back to exactly which version of the tool produced it.
+
+- **v0.8** (current): `signal_verdict` / `--min-time-to-event-ms` — flags
+  whether the FIRST transmission of a `splice_event_id` met SCTE-35's own
+  4-second minimum advance-notice requirement (9.2/10.3.3, see "Time to
+  event vs. actual pre-roll"), with `RETRANSMISSION` handling for resent
+  cues. Plus: version numbering itself (`--version`, startup log line,
+  `tool_version` in JSON output).
+- Earlier changes, not retroactively version-numbered, included in this
+  release: `time_to_event_ms`/`actual_preroll_ms`/`preroll_delta_ms`/
+  `preroll_verdict` (declared vs. actual pre-roll, `--preroll-tolerance-ms`),
+  `validate_ipv4_literal()` (guards against `socket.gaierror` from a bad
+  `--addr`), `--ts-dump-dir` (raw TS dump around SCTE-35 events), and this
+  English README translation.
+
+Future changes will be added here with a version number, so you can see
+what changed between the versions you actually run in production.
