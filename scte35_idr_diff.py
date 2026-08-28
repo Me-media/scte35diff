@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 scte35_idr_diff.py
-Version: 0.8
+Version: 0.10
 
 Measures the PTS delta between SCTE-35 splice points (splice_insert /
 time_signal, program-level splice_time) carried in a SCTE-35 PID and the
@@ -98,6 +98,20 @@ truth in a compliance report):
      retransmit, or reuses splice_event_id across genuinely distinct
      events, this dedup heuristic may need revisiting.
 
+  8. --input-file (file mode): the file is read once, start to finish, as
+     fast as disk I/O allows -- NOT paced to whatever real-time cadence the
+     stream originally had. This makes actual_preroll_ms/preroll_verdict
+     meaningless in file mode (there is no "real time" being measured, only
+     however long this process took to read the file), and means
+     --timeout-s's normal live-capture semantics (wait up to N seconds for
+     a matching IDR) do not apply the way they do live: reaching end of
+     file with a splice point still pending is treated as conclusive --
+     "no matching IDR ever arrived" -- and reported as MISSED immediately
+     (see flush_pending_as_missed()), regardless of --timeout-s. Everything
+     else (PID/codec auto-detection, PTS-domain matching, time_to_event_ms,
+     signal_verdict, CSV/JSON schema) works identically to live capture.
+     See "File input mode" in the README.
+
 Usage examples:
   # Raw UDP multicast, auto-detect video codec + PIDs from PAT/PMT
   sudo python3 scte35_idr_diff.py --addr 239.1.1.1 --port 5000
@@ -109,6 +123,19 @@ Usage examples:
   # Manual PID override (no CUEI registration descriptor in PMT)
   python3 scte35_idr_diff.py --addr 239.1.1.1 --port 5000 \\
       --pid-video 0x101 --pid-scte35 0x1F0
+
+  # Local testing against loopback, no real multicast network needed --
+  # --addr outside 224.0.0.0-239.255.255.255 is treated as plain unicast
+  # UDP (no group join attempted), so this "just works" against e.g. an
+  # ffmpeg/tsp test stream aimed at 127.0.0.1:
+  python3 scte35_idr_diff.py --addr 127.0.0.1 --port 5000
+
+  # Reprocess a captured file offline instead of a live feed -- e.g. a
+  # --ts-dump-dir capture from an earlier incident, or any standard
+  # 188-byte-aligned .ts file. Runs once start to finish, then exits on
+  # its own (no --duration/Ctrl-C needed). See caveat 8 above for what
+  # this does NOT tell you (actual_preroll_ms/preroll_verdict, timing):
+  python3 scte35_idr_diff.py --input-file capture.ts --csv-out report.csv
 
   # Capture EVERYTHING SCTE-35 related (all commands, all descriptor
   # fields, including splice_null/canceled/immediate messages that never
@@ -232,7 +259,7 @@ except ImportError:  # fall back to the older package name
     except ImportError:
         Cue = None
 
-__version__ = "0.8"
+__version__ = "0.10"
 
 TS_PACKET_SIZE = 188
 SYNC_BYTE = 0x47
@@ -621,6 +648,19 @@ def validate_ipv4_literal(value, flag_name):
         sys.exit(1)
 
 
+def is_multicast_ipv4(addr):
+    """True if `addr` (a dotted-quad string that has already passed
+    validate_ipv4_literal()) falls in the IPv4 multicast range
+    224.0.0.0-239.255.255.255 (i.e. first octet 224-239). Used by
+    open_multicast_socket() to decide whether to actually join a multicast
+    group (IP_ADD_MEMBERSHIP) or just listen for plain unicast UDP --
+    joining a "multicast group" that isn't actually a multicast address
+    (e.g. 127.0.0.1, or any regular unicast IP) fails at the socket layer
+    with an opaque OSError, not a useful error message."""
+    first_octet = int(addr.split(".")[0])
+    return 224 <= first_octet <= 239
+
+
 # --------------------------------------------------------------------------
 # Multicast / RTP ingest
 # --------------------------------------------------------------------------
@@ -634,6 +674,19 @@ def open_multicast_socket(addr, port, iface):
     validate_ipv4_literal(addr, "--addr")
     if iface:
         validate_ipv4_literal(iface, "--iface")
+
+    # --addr is only actually joined as a multicast group if it's IN the
+    # IPv4 multicast range (224.0.0.0-239.255.255.255). Any other value --
+    # most usefully 127.0.0.1 for local testing (e.g. against ffmpeg/tsp
+    # sending plain UDP straight to loopback, no real network or IGMP
+    # required), but this also covers a host's own unicast interface
+    # address -- is instead just bound and listened on directly as plain
+    # unicast UDP, with no IP_ADD_MEMBERSHIP join at all. Attempting that
+    # join against a non-multicast address fails at the socket layer with
+    # an opaque "OSError: [Errno 22] Invalid argument", not a useful
+    # message, so this is decided up front instead of being left to blow up
+    # there.
+    multicast = is_multicast_ipv4(addr)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -669,9 +722,38 @@ def open_multicast_socket(addr, port, iface):
             addr, port, exc, addr)
         sock.close()
         sys.exit(1)
-    mreq = struct.pack("4s4s", socket.inet_aton(addr),
-                        socket.inet_aton(iface) if iface else socket.INADDR_ANY.to_bytes(4, "big"))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+    if multicast:
+        mreq = struct.pack("4s4s", socket.inet_aton(addr),
+                            socket.inet_aton(iface) if iface else socket.INADDR_ANY.to_bytes(4, "big"))
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError as exc:
+            # Defense in depth, mirroring the bind() handling above: this
+            # normally shouldn't happen (addr is confirmed multicast at
+            # this point), but an unusual host network stack/NIC could
+            # still reject the join, and a raw traceback here isn't
+            # actionable.
+            log.error(
+                "Failed to join multicast group %s on port %d (%s). Check that %s is "
+                "actually reachable/routed on this host's network (or the interface given "
+                "via --iface, currently %s), and that no firewall/iptables rule is blocking "
+                "IGMP.", addr, port, exc, addr, iface or "default route")
+            sock.close()
+            sys.exit(1)
+    else:
+        if iface:
+            log.warning(
+                "--iface (%s) is ignored: %s is not a multicast address, so there is no "
+                "multicast group to join on a specific interface.", iface, addr)
+        log.warning(
+            "%s is not a multicast address (224.0.0.0-239.255.255.255) -- running in "
+            "UNICAST/local-test mode instead: listening for plain UDP sent directly to "
+            "%s:%d, with no multicast group join. Useful for local testing (e.g. "
+            "--addr 127.0.0.1 against an ffmpeg/tsp test stream aimed at loopback), but "
+            "double-check this is intentional -- a mistyped multicast address would also "
+            "silently land here instead of erroring.", addr, addr, port)
+
     sock.settimeout(2.0)
     return sock
 
@@ -1274,7 +1356,7 @@ class Probe:
         still_pending = []
         for entry in self.pending:
             if now > entry["deadline"]:
-                self._emit(entry, idr_ticks=None, kind=None, missed=True)
+                self._emit(entry, idr_ticks=None, kind=None, missed=True, miss_reason="timeout")
             else:
                 still_pending.append(entry)
         self.pending = still_pending
@@ -1302,11 +1384,30 @@ class Probe:
             self.pending.remove(best)
             self._emit(best, idr_ticks=idr_ticks, kind=kind, missed=False)
 
-    def _emit(self, entry, idr_ticks, kind, missed):
+    def flush_pending_as_missed(self, reason="eof"):
+        """Called once at shutdown -- Ctrl-C on a live capture, or reaching
+        the end of --input-file -- for any splice point still sitting in
+        self.pending at that point: it never got a matching IDR before the
+        run ended, so it's reported as MISSED here instead of just quietly
+        vanishing from the CSV/JSON/console output with no record at all.
+        This does NOT wait for --timeout-s to actually elapse (there may be
+        nothing left to wait on, e.g. --input-file has no more data coming)
+        -- reaching the end of input while a cue is still open is itself
+        conclusive: no matching IDR arrived. `reason` is passed through to
+        _emit() to produce an accurate verdict string (a genuine mid-stream
+        timeout reads differently than "we ran out of input")."""
+        still_pending = self.pending
+        self.pending = []
+        for entry in still_pending:
+            self._emit(entry, idr_ticks=None, kind=None, missed=True, miss_reason=reason)
+
+    def _emit(self, entry, idr_ticks, kind, missed, miss_reason="timeout"):
         wallclock = time.strftime("%Y-%m-%dT%H:%M:%S")
         if missed:
             delta_ms = None
-            verdict = "MISSED (no IDR near target PTS within timeout)"
+            verdict = ("MISSED (input ended before a matching IDR was found)"
+                       if miss_reason == "eof" else
+                       "MISSED (no IDR near target PTS within timeout)")
             idr_pts_s = None
         else:
             delta_ms = pts_diff_seconds(idr_ticks, entry["target_ticks"]) * 1000.0
@@ -1598,6 +1699,39 @@ def extract_ts_packets(buf):
     return packets, buf[i:]
 
 
+def process_ts_file(probe, path):
+    """Read raw MPEG-TS packets from the local file at `path` and feed each
+    one through probe.handle_ts_packet(), exactly like a live capture would
+    -- this is the entirety of what --input-file does, factored out of
+    main() so it's directly testable without a live socket, argparse, or
+    threefive3 installed. No RTP stripping (a captured .ts file -- e.g.
+    from --ts-dump-dir -- is raw TS by convention, unlike a live UDP feed
+    which may be RTP-encapsulated) and no real-time pacing: the file is
+    read as fast as disk I/O allows. See the --input-file help text and
+    the "File input mode" README section for what that means for
+    actual_preroll_ms/preroll_verdict/timeout-based MISSED verdicts.
+
+    Returns the number of complete 188-byte TS packets processed. Raises
+    OSError if the file can't be opened/read."""
+    packets_seen = 0
+    leftover = bytearray()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)  # 1 MiB at a time
+            if not chunk:
+                break
+            leftover += chunk
+            packets, leftover = extract_ts_packets(leftover)
+            leftover = bytearray(leftover)
+            for pkt in packets:
+                packets_seen += 1
+                probe.handle_ts_packet(pkt)
+    if leftover:
+        log.warning("%d trailing byte(s) at end of %s did not form a complete 188-byte TS "
+                    "packet -- ignored (likely a truncated capture).", len(leftover), path)
+    return packets_seen
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Measure SCTE-35 splice-point PTS vs. video IDR PTS "
@@ -1606,9 +1740,33 @@ def main():
         epilog=__doc__,
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    ap.add_argument("--addr", required=True, help="Multicast group address, e.g. 239.1.1.1")
-    ap.add_argument("--port", required=True, type=int, help="UDP port")
-    ap.add_argument("--iface", default=None, help="Local interface IP to join the group on")
+    ap.add_argument("--addr", default=None,
+                    help="Multicast group address, e.g. 239.1.1.1 (224.0.0.0-239.255.255.255 -- "
+                         "an IP_ADD_MEMBERSHIP join is performed). Anything outside that range "
+                         "(most usefully 127.0.0.1) is instead treated as a plain UNICAST address "
+                         "for local testing: no group join is attempted, the tool just listens "
+                         "for UDP sent directly to that address:port -- handy for pointing an "
+                         "ffmpeg/tsp test stream at loopback without any real multicast network. "
+                         "Required unless --input-file is given.")
+    ap.add_argument("--port", default=None, type=int,
+                    help="UDP port. Required unless --input-file is given.")
+    ap.add_argument("--input-file", default=None,
+                    help="Read raw MPEG-TS from this local file instead of a live multicast/UDP "
+                         "source -- e.g. a capture produced by --ts-dump-dir, or any standard "
+                         "188-byte-aligned .ts file (VLC/ffmpeg/TSDuck-compatible). Mutually "
+                         "exclusive with --addr/--port; --iface/--transport/--duration are ignored "
+                         "(with a warning) since there's no live socket to configure. The whole "
+                         "file is read once, start to finish, as fast as disk I/O allows -- NOT "
+                         "paced to its original real-time cadence -- then the tool exits on its "
+                         "own (no Ctrl-C needed). Because of that, actual_preroll_ms/"
+                         "preroll_verdict and the --timeout-s-based MISSED verdict do NOT reflect "
+                         "genuine real-time delivery in this mode; any splice point still pending "
+                         "when the file ends is reported as MISSED regardless of --timeout-s. See "
+                         "'File input mode' in the README before relying on those specific fields "
+                         "from a file-mode run.")
+    ap.add_argument("--iface", default=None,
+                    help="Local interface IP to join the group on. Only meaningful when --addr is "
+                         "an actual multicast address -- ignored (with a warning) otherwise.")
     ap.add_argument("--transport", choices=["auto", "ts", "rtp"], default="auto",
                     help="Payload framing: raw MPEG-TS-over-UDP, RTP-encapsulated, or auto-detect")
     ap.add_argument("--program", type=int, default=None,
@@ -1750,10 +1908,58 @@ def main():
         log.error("--ts-dump-window must be > 0 (got %s)", args.ts_dump_window)
         sys.exit(1)
 
+    # -- Input source: exactly one of --input-file, or --addr + --port. --
+    if args.input_file:
+        if args.addr or args.port:
+            log.error("--input-file is mutually exclusive with --addr/--port -- pick one input "
+                       "source (a live multicast/unicast feed, or a local MPEG-TS file).")
+            sys.exit(1)
+        if not os.path.isfile(args.input_file):
+            log.error("--input-file %r not found (or not a regular file).", args.input_file)
+            sys.exit(1)
+        if args.iface:
+            log.warning("--iface is ignored with --input-file (no network socket is opened).")
+        if args.transport != "auto":
+            log.warning("--transport is ignored with --input-file: file input is always read as "
+                        "raw MPEG-TS (matching what --ts-dump-dir produces), never RTP-stripped.")
+        if args.duration:
+            log.warning("--duration is ignored with --input-file: the whole file is processed "
+                        "once, start to finish, rather than for a fixed wall-clock time.")
+    else:
+        if not args.addr or not args.port:
+            log.error("Either --input-file, or both --addr and --port, must be given.")
+            sys.exit(1)
+
     probe = Probe(args)
+
+    if args.input_file:
+        # -- Batch mode: read a local MPEG-TS file through the exact same
+        # Probe.handle_ts_packet() pipeline used for live capture (via
+        # process_ts_file()), so CSV/JSON/console output is otherwise
+        # identical -- just driven by disk reads instead of socket
+        # recvfrom(). See process_ts_file()'s docstring and the
+        # --input-file help text for what that means for
+        # actual_preroll_ms/preroll_verdict/timeout-based MISSED verdicts.
+        log.info("Reading MPEG-TS from file: %s", args.input_file)
+        try:
+            packets_seen = process_ts_file(probe, args.input_file)
+        except OSError as exc:
+            log.error("Failed to read --input-file %s: %s", args.input_file, exc)
+            probe.flush_pending_as_missed(reason="eof")
+            probe.close()
+            sys.exit(1)
+        probe.flush_pending_as_missed(reason="eof")
+        probe.close()
+        log.info("Finished reading file. %d TS packets processed.", packets_seen)
+        return
+
     sock = open_multicast_socket(args.addr, args.port, args.iface)
-    log.info("Joined multicast %s:%d (iface=%s, transport=%s)",
-             args.addr, args.port, args.iface or "any", args.transport)
+    if is_multicast_ipv4(args.addr):
+        log.info("Joined multicast %s:%d (iface=%s, transport=%s)",
+                 args.addr, args.port, args.iface or "any", args.transport)
+    else:
+        log.info("Listening for unicast UDP on %s:%d (transport=%s)",
+                 args.addr, args.port, args.transport)
 
     stop = {"flag": False}
 
@@ -1789,6 +1995,10 @@ def main():
                 packets_seen += 1
                 probe.handle_ts_packet(pkt)
     finally:
+        # A splice point still pending here never got a matching IDR
+        # before the run stopped (Ctrl-C) -- report it as MISSED instead
+        # of silently dropping it from the output with no record at all.
+        probe.flush_pending_as_missed(reason="timeout")
         probe.close()
         sock.close()
         log.info("Stopped. %d TS packets processed.", packets_seen)
