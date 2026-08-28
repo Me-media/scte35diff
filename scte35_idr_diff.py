@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 scte35_idr_diff.py
+Version: 0.8
 
 Measures the PTS delta between SCTE-35 splice points (splice_insert /
 time_signal, program-level splice_time) carried in a SCTE-35 PID and the
@@ -54,6 +55,48 @@ truth in a compliance report):
   5. This is a diagnostic/QC tool, not a certified SCTE-35 conformance
      tester. Validate findings against a reference tool (e.g. TSDuck's
      `tsp -P scte35`) before escalating to a vendor.
+
+  6. time_to_event_ms / actual_preroll_ms: time_to_event_ms is a PTS-domain
+     figure (target PTS minus the most recently observed video PTS at the
+     moment the cue is registered) -- it approximates "how far in the
+     future, per the transport stream's own clock, was this splice
+     signaled", the same concept a PCR/PTS-correlating analyzer computes,
+     but WITHOUT parsing PCR: it uses the nearest preceding video AU's PTS
+     instead of a true STC interpolation, so it carries a small error
+     bounded by roughly one video frame interval. actual_preroll_ms is a
+     WALL-CLOCK figure (real elapsed time, via a monotonic clock, between
+     registering the cue and observing the matching IDR) -- it is only
+     meaningful if the feed is arriving in genuine real time (a live
+     encoder/multicast feed; NOT a file replayed faster/slower than real
+     time, which would make actual_preroll_ms meaningless). ANSI/SCTE 35
+     itself does NOT require these two to be equal, nor does it define a
+     tolerance for that gap -- preroll_delta_ms/PREROLL_SHORT is this
+     tool's own operational check, not a cited standards requirement. A
+     large negative preroll_delta_ms (actual well below declared) is
+     therefore not itself a standards violation, but IS operationally
+     significant: it means downstream ad-decisioning/splicing equipment
+     got materially less real reaction time than the cue's own timing
+     implied.
+
+  7. signal_verdict / --min-time-to-event-ms: unlike preroll_delta_ms
+     above, SCTE-35 DOES appear to specify a minimum advance-notice
+     requirement for the message itself -- per secondary sources citing
+     ANSI/SCTE 35 (2019) sections 9.2 (splice_insert) and 10.3.3
+     (time_signal): "sent at least once a minimum of 4 seconds in advance
+     of the desired splice time" (corroborated independently by ETSI TS
+     103 752-1 clause 7.2, which cites the same 4-second SCTE-35 minimum).
+     This has NOT been verified against the primary ANSI/SCTE 35 text
+     itself (access to the full standard was not available when this was
+     written) -- treat the citation as secondary-source-corroborated, not
+     primary-verified. signal_verdict=SIGNAL_LATE flags the FIRST
+     registered occurrence of a splice_event_id whose time_to_event_ms is
+     below --min-time-to-event-ms (default 4000). Later retransmissions of
+     the same event_id (common practice, for resilience against packet
+     loss) are reported as RETRANSMISSION rather than re-evaluated, since
+     the 4-second requirement is about the initial signal, not every
+     repeat as the splice point gets closer -- if your encoder does not
+     retransmit, or reuses splice_event_id across genuinely distinct
+     events, this dedup heuristic may need revisiting.
 
 Usage examples:
   # Raw UDP multicast, auto-detect video codec + PIDs from PAT/PMT
@@ -137,6 +180,31 @@ Output channels (independent of each other, enable any combination):
                       and the "Raw TS dump around SCTE-35 events" README
                       section for the memory/disk trade-offs before
                       enabling this on a high-bitrate feed.
+  time_to_event_ms / actual_preroll_ms / preroll_delta_ms / preroll_verdict
+                      Always computed (no flag needed), in every match/miss
+                      CSV/JSON row and the console verdict line: how much
+                      lead time the SCTE-35 cue's own PTS declared
+                      (time_to_event_ms), how much lead time was actually
+                      observed in real time (actual_preroll_ms), and their
+                      difference (preroll_delta_ms). Flagged
+                      preroll_verdict=PREROLL_SHORT when the actual pre-roll
+                      falls more than --preroll-tolerance-ms short of the
+                      declared one -- i.e. downstream ad-decisioning got
+                      less real reaction time than the cue implied. See
+                      caveat 6 above and the "Time to event vs. actual
+                      pre-roll" README section before treating this as a
+                      strict SCTE-35 conformance check -- it is not one.
+  signal_verdict      Always computed (no flag needed): whether the FIRST
+                      registered transmission of a given splice_event_id
+                      met SCTE-35's own apparent minimum advance-notice
+                      requirement (>= --min-time-to-event-ms, default
+                      4000ms -- see caveat 7 above). SIGNAL_LATE if below
+                      that floor, OK if not, RETRANSMISSION for later
+                      repeats of the same event_id (not re-evaluated), N/A
+                      if time_to_event_ms itself could not be computed.
+                      Unlike preroll_verdict, this one IS meant to reflect
+                      an actual (secondary-source-cited, not
+                      primary-verified) SCTE-35 requirement -- see caveat 7.
 """
 
 import argparse
@@ -163,6 +231,8 @@ except ImportError:  # fall back to the older package name
         from threefive import Cue
     except ImportError:
         Cue = None
+
+__version__ = "0.8"
 
 TS_PACKET_SIZE = 188
 SYNC_BYTE = 0x47
@@ -523,11 +593,48 @@ def parse_duration_seconds(value):
         raise argparse.ArgumentTypeError(f"invalid duration: {value!r}")
 
 
+def validate_ipv4_literal(value, flag_name):
+    """Raise a clear, actionable error if `value` is not a plain dotted-
+    quad IPv4 address (e.g. 239.1.1.1) -- used for --addr/--iface.
+
+    Why this exists: socket.socket.bind((host, port)) resolves `host`
+    through the system's normal getaddrinfo()/NSS machinery even when it's
+    already a numeric literal, same as it would for a DNS hostname. If
+    `value` is anything other than a valid IPv4 literal (a typo, a stray
+    character, or an actual hostname that isn't resolvable on THIS host --
+    e.g. a headend/internal DNS name that only exists on the server you
+    tested on before), bind() fails with the opaque
+    "socket.gaierror: [Errno -2] Name or service not known" and a raw
+    traceback instead of a message that says what's actually wrong.
+    socket.inet_aton() below does pure string parsing -- it never touches
+    DNS/NSS -- so this check fails fast with a clear diagnosis before any
+    network call is attempted."""
+    try:
+        socket.inet_aton(value)
+    except OSError:
+        log.error(
+            "%s must be a plain numeric IPv4 address (e.g. 239.1.1.1), not a hostname -- "
+            "got %r. This is also the most common cause of the confusing "
+            "'socket.gaierror: Name or service not known' error: a DNS name (or internal "
+            "hosts-file entry) that resolved on one server may simply not exist on another.",
+            flag_name, value)
+        sys.exit(1)
+
+
 # --------------------------------------------------------------------------
 # Multicast / RTP ingest
 # --------------------------------------------------------------------------
 
 def open_multicast_socket(addr, port, iface):
+    # Validate BEFORE any network call: inet_aton() is pure string parsing
+    # (never touches DNS/NSS), so this fails fast with a clear message
+    # instead of bind() below raising an opaque socket.gaierror -- see
+    # validate_ipv4_literal() for why that matters on a host where addr
+    # isn't a valid literal (typo, or a hostname not resolvable here).
+    validate_ipv4_literal(addr, "--addr")
+    if iface:
+        validate_ipv4_literal(iface, "--iface")
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -546,7 +653,22 @@ def open_multicast_socket(addr, port, iface):
     # instances of this tool against different multicast groups (even on
     # the same port) no longer cross-contaminates each other's PAT/PMT/
     # SCTE-35/video parsing.
-    sock.bind((addr, port))
+    try:
+        sock.bind((addr, port))
+    except socket.gaierror as exc:
+        # Defense in depth: validate_ipv4_literal() above should already
+        # have caught a non-numeric addr, so reaching this normally means
+        # something more unusual about the host's resolver setup. Fail with
+        # a diagnosis instead of a bare traceback either way.
+        log.error(
+            "Failed to bind to %s:%d (%s). %r passed IPv4-literal validation but the "
+            "system's own address resolution (getaddrinfo) still rejected it -- this can "
+            "happen on a host with a broken/missing resolver configuration "
+            "(e.g. no /etc/nsswitch.conf or /etc/resolv.conf). Try binding to 0.0.0.0 "
+            "manually to confirm, or check the host's network/DNS configuration.",
+            addr, port, exc, addr)
+        sock.close()
+        sys.exit(1)
     mreq = struct.pack("4s4s", socket.inet_aton(addr),
                         socket.inet_aton(iface) if iface else socket.INADDR_ANY.to_bytes(4, "big"))
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
@@ -602,7 +724,28 @@ class Probe:
         self.max_early_s = args.max_early_ms / 1000.0
         self.timeout_s = args.timeout_s
         self.ok_threshold_ms = args.ok_threshold_ms
+        self.preroll_tolerance_ms = getattr(args, "preroll_tolerance_ms", 500.0)
+        # SCTE-35's own minimum advance-notice requirement (per secondary
+        # sources citing ANSI/SCTE 35 (2019) 9.2/10.3.3: "sent at least once
+        # a minimum of 4 seconds in advance of the desired splice time") --
+        # see _register_cue()/signal_verdict and the "Time to event vs.
+        # actual pre-roll" README section for the caveats on this citation
+        # and on what "first signal" means for a retransmitted event.
+        self.min_time_to_event_ms = getattr(args, "min_time_to_event_ms", 4000.0)
+        # splice_event_id values already seen, so a legitimately retransmitted
+        # copy of the same event (common practice, to survive packet loss) is
+        # not re-evaluated against the 4-second-minimum requirement -- that
+        # requirement is about the FIRST time the event is signaled, not
+        # every repeat as the target PTS gets closer (which would trivially
+        # -- and wrongly -- flag every retransmitted event as late).
+        self._seen_scte35_event_ids = set()
         self.include_cra = args.include_cra
+        # Most recently observed video access unit's PTS, updated on EVERY
+        # AU (not just IDRs) -- used as the "live video position" reference
+        # point for computing each cue's declared time-to-event at the
+        # moment it's registered. See _register_cue()/_emit() for the
+        # actual/declared pre-roll measurement this feeds.
+        self.last_video_pts_ticks = None
         self.scte35_seq = 0
         self.csv_writer = None
         self.csv_file = None
@@ -678,6 +821,8 @@ class Probe:
                     "target_pts_s", "raw_pts_time_s", "pts_adjustment_ticks",
                     "idr_pts_s", "delta_ms", "verdict", "codec", "au_kind",
                     "segmentation_summary", "snapshot_path", "pre_frame_snapshot_paths",
+                    "time_to_event_ms", "actual_preroll_ms", "preroll_delta_ms", "preroll_verdict",
+                    "signal_verdict",
                 ])
         if args.json_out:
             self.json_out = open(args.json_out, "a")
@@ -774,6 +919,7 @@ class Probe:
         if self.scte35_out:
             full = cue_to_dict(cue)
             self.scte35_out.write(json.dumps({
+                "tool_version": __version__,
                 "cue_seq": seq,
                 "wallclock": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "scte35_pid": self.scte35_pid,
@@ -802,6 +948,48 @@ class Probe:
         command_type = type(cmd).__name__
         segmentation_summary = summarize_descriptors(cue)
         now = time.monotonic()
+        # "Declared" time-to-event: how far in the future the splice is
+        # signaled to occur, measured in the PTS domain, relative to the
+        # most recently observed video PTS at the moment THIS cue arrives
+        # (i.e. the live video position the probe has actually seen so
+        # far -- an approximation of "the PTS at which the SCTE-35 message
+        # itself was transmitted", the same concept professional TS
+        # analyzers derive via PCR/PTS correlation, here approximated by
+        # nearest-preceding video AU instead of a full PCR clock recovery).
+        # None if no video AU has been seen yet when the cue arrives.
+        if self.last_video_pts_ticks is not None:
+            time_to_event_ms = pts_diff_seconds(target_ticks, self.last_video_pts_ticks) * 1000.0
+        else:
+            time_to_event_ms = None
+            self.scte35_logger.debug(
+                "SCTE-35 #%d: no video PTS observed yet -- cannot compute a "
+                "declared time-to-event for this cue.", seq)
+
+        # -- signal_verdict: was THIS event first signaled far enough ahead
+        # of its own splice time to meet SCTE-35's own minimum advance-
+        # notice requirement (per secondary sources citing ANSI/SCTE 35
+        # (2019) 9.2/10.3.3: "sent at least once a minimum of 4 seconds in
+        # advance of the desired splice time", default --min-time-to-event-ms
+        # 4000)? That requirement is about the FIRST transmission of a given
+        # splice_event_id -- an encoder is expected to retransmit the same
+        # event as insurance against packet loss, and each later retransmit
+        # necessarily has a smaller time_to_event_ms as the splice point
+        # approaches, so only the first occurrence of an event_id is
+        # evaluated; later ones are reported as RETRANSMISSION rather than
+        # re-flagged as late. If event_id itself is missing/None (nothing to
+        # dedupe on), every occurrence is treated as first.
+        if event_id is not None and event_id in self._seen_scte35_event_ids:
+            signal_verdict = "RETRANSMISSION"
+        else:
+            if event_id is not None:
+                self._seen_scte35_event_ids.add(event_id)
+            if time_to_event_ms is None:
+                signal_verdict = "N/A"
+            elif time_to_event_ms < self.min_time_to_event_ms:
+                signal_verdict = "SIGNAL_LATE"
+            else:
+                signal_verdict = "OK"
+
         entry = {
             "cue_seq": seq,
             "target_ticks": target_ticks,
@@ -812,6 +1000,9 @@ class Probe:
             "out_of_network": out_of_network,
             "segmentation_summary": segmentation_summary,
             "deadline": now + self.timeout_s,
+            "register_monotonic": now,
+            "time_to_event_ms": time_to_event_ms,
+            "signal_verdict": signal_verdict,
         }
         self.pending.append(entry)
         # Full detail goes to the dedicated SCTE-35 channel; the main log
@@ -820,9 +1011,23 @@ class Probe:
         # busy SCTE-35 PID.
         self.scte35_logger.info(
             "SCTE-35 #%d queued for matching: %s event_id=%s target_pts=%.6fs "
-            "(raw pts_time=%.6f, pts_adjustment=%s) descriptors=[%s]",
+            "(raw pts_time=%.6f, pts_adjustment=%s) time_to_event=%s "
+            "signal_verdict=%s descriptors=[%s]",
             seq, command_type, event_id, target_ticks / PTS_HZ, pts_time,
-            pts_adjustment, "; ".join(segmentation_summary))
+            pts_adjustment,
+            "n/a" if time_to_event_ms is None else f"{time_to_event_ms:.1f}ms",
+            signal_verdict,
+            "; ".join(segmentation_summary))
+        if signal_verdict == "SIGNAL_LATE":
+            # Worth surfacing immediately, not just once the eventual
+            # match/miss resolves (which may be seconds away, or never, if
+            # the splice is later missed) -- an operator watching the main
+            # log should see this as soon as it's known.
+            self.scte35_logger.warning(
+                "SCTE-35 #%d event_id=%s: first-signaled time_to_event=%.1fms "
+                "is BELOW the %.0fms SCTE-35 minimum advance-notice "
+                "requirement (see README) -- signal_verdict=SIGNAL_LATE",
+                seq, event_id, time_to_event_ms, self.min_time_to_event_ms)
 
     # -- Video / IDR handling --------------------------------------------
 
@@ -835,6 +1040,11 @@ class Probe:
         pts, dts, es_payload = parsed
         if self.video_codec not in ("h264", "hevc"):
             return
+        if pts is not None:
+            # Track the live video position from EVERY access unit (not
+            # just IDRs) -- this is the reference point _register_cue()
+            # uses to compute each cue's declared time-to-event.
+            self.last_video_pts_ticks = pts
         nal_types = list(find_nal_types(es_payload, self.video_codec))
         if self.snapshot_dir:
             # Keep the most recently seen parameter sets warm from EVERY
@@ -1112,6 +1322,43 @@ class Probe:
                          if (self.snapshot_dir and not missed) else None)
         pre_frame_paths = (self._pending_pre_frame_paths.pop(idr_ticks, [])
                            if (self.snapshot_dir and not missed) else [])
+
+        # -- Declared vs. actual pre-roll --------------------------------
+        # time_to_event_ms: the DECLARED lead time, computed once at cue
+        # registration (see _register_cue) from target_ticks minus the
+        # video PTS observed at that moment -- a PTS-domain, "what the
+        # cue itself claims" figure.
+        # actual_preroll_ms: the REAL, wall-clock elapsed time between
+        # registering the cue and actually observing/matching the IDR --
+        # this is what a downstream ad-decisioning system genuinely got
+        # to react in, regardless of what the PTS math promised. Only
+        # meaningful for an actual match (a MISSED cue never got an IDR to
+        # measure against); it also assumes the feed is arriving live/in
+        # real time -- see the "Time to event vs. actual pre-roll" README
+        # section for why a non-real-time replay invalidates this figure.
+        time_to_event_ms = entry.get("time_to_event_ms")
+        actual_preroll_ms = ((time.monotonic() - entry["register_monotonic"]) * 1000.0
+                             if not missed else None)
+        preroll_delta_ms = (None if (time_to_event_ms is None or actual_preroll_ms is None)
+                            else actual_preroll_ms - time_to_event_ms)
+        if preroll_delta_ms is None:
+            preroll_verdict = "N/A"
+        elif preroll_delta_ms < -self.preroll_tolerance_ms:
+            # Actual delivered lead time fell short of what the cue's own
+            # PTS declared -- the operationally important case: downstream
+            # ad-decisioning/splicing may have gotten less warning than it
+            # was promised.
+            preroll_verdict = "PREROLL_SHORT"
+        else:
+            preroll_verdict = "OK"
+
+        # signal_verdict was already decided at registration time (see
+        # _register_cue) -- whether THIS event's first transmission met
+        # SCTE-35's own minimum advance-notice requirement. Carried through
+        # here unchanged so it rides along with the rest of the match/miss
+        # outcome in every output channel.
+        signal_verdict = entry.get("signal_verdict", "N/A")
+
         line = (f"[{wallclock}] event_id={entry['event_id']} "
                 f"type={entry['command_type']} oon={entry['out_of_network']} "
                 f"target_pts={target_pts_s:.6f}s "
@@ -1119,8 +1366,12 @@ class Probe:
                 f"delta={'n/a' if delta_ms is None else f'{delta_ms:+.1f}ms'} "
                 f"verdict={verdict}"
                 + (f" snapshot={snapshot_path}" if snapshot_path else "")
-                + (f" pre_frames={len(pre_frame_paths)}" if pre_frame_paths else ""))
-        (log.warning if missed or (delta_ms is not None and abs(delta_ms) > self.ok_threshold_ms) else log.info)(line)
+                + (f" pre_frames={len(pre_frame_paths)}" if pre_frame_paths else "")
+                + (f" time_to_event={'n/a' if time_to_event_ms is None else f'{time_to_event_ms:.1f}ms'}"
+                   f" actual_preroll={'n/a' if actual_preroll_ms is None else f'{actual_preroll_ms:.1f}ms'}"
+                   f" preroll_verdict={preroll_verdict} signal_verdict={signal_verdict}"))
+        (log.warning if missed or (delta_ms is not None and abs(delta_ms) > self.ok_threshold_ms)
+         or preroll_verdict == "PREROLL_SHORT" or signal_verdict == "SIGNAL_LATE" else log.info)(line)
 
         if self.csv_writer:
             self.csv_writer.writerow([
@@ -1133,10 +1384,16 @@ class Probe:
                 "; ".join(entry.get("segmentation_summary") or []),
                 snapshot_path or "",
                 "; ".join(pre_frame_paths),
+                "" if time_to_event_ms is None else f"{time_to_event_ms:.1f}",
+                "" if actual_preroll_ms is None else f"{actual_preroll_ms:.1f}",
+                "" if preroll_delta_ms is None else f"{preroll_delta_ms:.1f}",
+                preroll_verdict,
+                signal_verdict,
             ])
             self.csv_file.flush()
         if self.json_out:
             self.json_out.write(json.dumps({
+                "tool_version": __version__,
                 "wallclock": wallclock, "cue_seq": entry.get("cue_seq"),
                 "event_id": entry["event_id"],
                 "command_type": entry["command_type"],
@@ -1150,6 +1407,11 @@ class Probe:
                 "codec": self.video_codec, "au_kind": kind,
                 "snapshot_path": snapshot_path,
                 "pre_frame_snapshot_paths": pre_frame_paths,
+                "time_to_event_ms": time_to_event_ms,
+                "actual_preroll_ms": actual_preroll_ms,
+                "preroll_delta_ms": preroll_delta_ms,
+                "preroll_verdict": preroll_verdict,
+                "signal_verdict": signal_verdict,
                 # cross-reference with --scte35-out using cue_seq for the
                 # complete raw SCTE-35 structure (all descriptor fields).
             }, default=str) + "\n")
@@ -1208,6 +1470,7 @@ class Probe:
                  f"_n{event_count}events.ts")
         path = os.path.join(self.ts_dump_dir, fname)
         meta = {
+            "tool_version": __version__,
             "path": path,
             "window_start_wallclock": window_start_wall,
             "window_end_wallclock": window_end_wall,
@@ -1342,6 +1605,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--addr", required=True, help="Multicast group address, e.g. 239.1.1.1")
     ap.add_argument("--port", required=True, type=int, help="UDP port")
     ap.add_argument("--iface", default=None, help="Local interface IP to join the group on")
@@ -1370,6 +1634,25 @@ def main():
                     help="How long to wait for a matching IDR before declaring a splice point missed")
     ap.add_argument("--ok-threshold-ms", type=float, default=41.0,
                     help="Delta below which alignment is reported OK (default ~1 frame at 24fps)")
+    ap.add_argument("--preroll-tolerance-ms", type=float, default=500.0,
+                    help="How far the ACTUAL (wall-clock measured) pre-roll may fall short of the "
+                         "DECLARED time-to-event (computed from the cue's own PTS at registration) "
+                         "before being flagged PREROLL_SHORT (default 500 ms). Only actual pre-roll "
+                         "shorter than declared is flagged -- extra pre-roll is never a problem. See "
+                         "'time_to_event_ms'/'actual_preroll_ms'/'preroll_delta_ms' in the "
+                         "csv-out/json-out/console output and the README section on this measurement "
+                         "for what it does and does not tell you.")
+    ap.add_argument("--min-time-to-event-ms", type=float, default=4000.0,
+                    help="Minimum DECLARED time-to-event (time_to_event_ms) a splice event's first "
+                         "transmission must have to satisfy SCTE-35's own minimum advance-notice "
+                         "requirement (per secondary sources citing ANSI/SCTE 35 (2019) 9.2/10.3.3: "
+                         "'sent at least once a minimum of 4 seconds in advance of the desired splice "
+                         "time' -- default 4000 ms; not independently verified against the primary "
+                         "standard text, see the README). Below this, the FIRST occurrence of a given "
+                         "splice_event_id is flagged signal_verdict=SIGNAL_LATE. Later retransmissions "
+                         "of the same event_id are reported as RETRANSMISSION, not re-flagged, since "
+                         "the requirement is about the initial signal, not every repeat as the splice "
+                         "point approaches.")
     ap.add_argument("--include-cra", action="store_true",
                     help="Also match HEVC CRA pictures as candidate splice points (flagged for review)")
     ap.add_argument("--csv-out", default=None, help="Append match/miss outcomes to this CSV file")
@@ -1446,6 +1729,7 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
     )
+    log.info("scte35_idr_diff.py version %s starting", __version__)
 
     if Cue is None:
         log.error("threefive3 not found. Install with: "
